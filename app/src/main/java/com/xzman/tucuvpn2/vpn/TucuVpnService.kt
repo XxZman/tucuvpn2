@@ -16,12 +16,6 @@ import com.xzman.tucuvpn2.R
 import com.xzman.tucuvpn2.ui.MainActivity
 import com.xzman.tucuvpn2.utils.AppLogger
 import kotlinx.coroutines.*
-import java.io.FileInputStream
-import java.io.FileOutputStream
-import java.net.DatagramPacket
-import java.net.DatagramSocket
-import java.net.InetAddress
-import java.nio.ByteBuffer
 
 /**
  * VPN Service that establishes the TUN interface and forwards traffic
@@ -110,18 +104,21 @@ class TucuVpnService : VpnService() {
                     allowFamily(android.system.OsConstants.AF_INET6)
                 }
 
-                vpnInterface = builder.establish()
-                    ?: throw Exception("No se pudo establecer la interfaz VPN")
+                val pfd = builder.establish()
+                    ?: throw Exception("No se pudo establecer la interfaz VPN (permiso denegado)")
+                vpnInterface = pfd
 
                 isConnected = true
                 updateNotification("Conectado a $serverIp")
                 AppLogger.log("Interfaz TUN establecida")
 
-                // Start the OpenVPN client tunnel
+                // Start the OpenVPN client tunnel.
+                // Pass the ParcelFileDescriptor directly — never use /proc/self/fd/$fd
+                // because SELinux blocks that path on Android.
                 val client = OpenVpnClient(
                     context = this@TucuVpnService,
                     vpnService = this@TucuVpnService,
-                    tunFd = vpnInterface!!.fd,
+                    tunPfd = pfd,
                     ovpnConfig = ovpnConfig,
                     serverIp = serverIp,
                     serverPort = serverPort

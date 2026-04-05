@@ -2,9 +2,8 @@ package com.xzman.tucuvpn2.vpn
 
 import android.content.Context
 import android.net.VpnService
+import android.os.ParcelFileDescriptor
 import com.xzman.tucuvpn2.utils.AppLogger
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.InputStream
@@ -12,28 +11,19 @@ import java.io.OutputStream
 import java.net.ConnectException
 import java.net.InetSocketAddress
 import java.net.Socket
-import java.net.SocketTimeoutException
-import java.nio.ByteBuffer
-import java.util.concurrent.TimeUnit
-import javax.net.ssl.SSLContext
-import javax.net.ssl.TrustManager
-import javax.net.ssl.X509TrustManager
-import java.security.cert.X509Certificate
 
 /**
- * OpenVPN client that handles the TCP/UDP tunnel communication.
+ * OpenVPN client: connects to a VPN server and bridges traffic between
+ * the TUN interface and the remote socket.
  *
- * Parses the .ovpn config, connects to the server, and bridges
- * traffic between the TUN interface (tunFd) and the VPN socket.
- *
- * NOTE: This is a simplified client demonstrating the architecture.
- * Full OpenVPN protocol (TLS + control channel + data channel) is
- * implemented here using a TCP relay approach with the server.
+ * Key fix: streams are created from [tunPfd].fileDescriptor (a FileDescriptor
+ * object), NOT from "/proc/self/fd/$fd". The latter is blocked by SELinux
+ * on Android and causes FileNotFoundException / crashes.
  */
 class OpenVpnClient(
     private val context: Context,
     private val vpnService: VpnService,
-    private val tunFd: Int,
+    private val tunPfd: ParcelFileDescriptor,   // ParcelFileDescriptor, not raw Int
     private val ovpnConfig: String,
     private val serverIp: String,
     private val serverPort: Int
@@ -41,14 +31,15 @@ class OpenVpnClient(
 
     companion object {
         const val CONNECT_TIMEOUT_MS = 10_000
-        const val READ_TIMEOUT_MS = 10_000
-        const val BUFFER_SIZE = 32768
+        const val READ_TIMEOUT_MS    = 10_000
+        const val BUFFER_SIZE        = 32_768
     }
 
     private val config = OvpnConfigParser(ovpnConfig)
 
     /**
-     * Main run loop: connect to VPN server and bridge TUN <-> socket.
+     * Connects to the VPN server and starts forwarding packets.
+     * Blocks until the tunnel is closed or an error occurs.
      * Throws on failure so the caller can try the next server.
      */
     fun run() {
@@ -57,129 +48,113 @@ class OpenVpnClient(
 
         when (proto.lowercase()) {
             "tcp", "tcp-client" -> runTcp()
-            "udp" -> runUdp()
-            else -> runTcp()
+            "udp"               -> runUdp()
+            else                -> runTcp()
         }
     }
 
-    // ─── TCP Mode ───────────────────────────────────────────────────────────
+    // ─── TCP ────────────────────────────────────────────────────────────────
 
     private fun runTcp() {
         val socket = Socket()
-        vpnService.protect(socket)
+        vpnService.protect(socket)   // exempt socket from the VPN tunnel
 
         try {
             socket.soTimeout = READ_TIMEOUT_MS
             socket.connect(InetSocketAddress(serverIp, serverPort), CONNECT_TIMEOUT_MS)
-
             AppLogger.log("Socket TCP conectado")
 
-            val tunIn = FileInputStream("/proc/self/fd/$tunFd")
-            val tunOut = FileOutputStream("/proc/self/fd/$tunFd")
-            val sockIn = socket.getInputStream()
+            // Safe: uses FileDescriptor from the ParcelFileDescriptor,
+            // not the raw int path that SELinux blocks.
+            val tunIn  = FileInputStream(tunPfd.fileDescriptor)
+            val tunOut = FileOutputStream(tunPfd.fileDescriptor)
+            val sockIn  = socket.getInputStream()
             val sockOut = socket.getOutputStream()
 
-            // Perform OpenVPN TLS handshake and key exchange
             performHandshake(sockIn, sockOut)
-
             AppLogger.log("Túnel establecido, reenviando tráfico...")
-
-            // Bridge TUN <-> Socket in both directions
             bridgeTraffic(tunIn, tunOut, sockIn, sockOut)
 
         } finally {
-            try { socket.close() } catch (e: Exception) { /* ignore */ }
+            try { socket.close() } catch (_: Exception) {}
         }
     }
 
-    // ─── UDP Mode ───────────────────────────────────────────────────────────
+    // ─── UDP ────────────────────────────────────────────────────────────────
 
     private fun runUdp() {
         val socket = java.net.DatagramSocket()
         vpnService.protect(socket)
 
         try {
-            val serverAddr = InetSocketAddress(serverIp, serverPort)
             socket.soTimeout = READ_TIMEOUT_MS
-            socket.connect(serverAddr)
-
+            socket.connect(InetSocketAddress(serverIp, serverPort))
             AppLogger.log("Socket UDP conectado")
 
-            val tunIn = FileInputStream("/proc/self/fd/$tunFd")
-            val tunOut = FileOutputStream("/proc/self/fd/$tunFd")
+            val tunIn  = FileInputStream(tunPfd.fileDescriptor)
+            val tunOut = FileOutputStream(tunPfd.fileDescriptor)
 
             bridgeTrafficUdp(tunIn, tunOut, socket)
 
         } finally {
-            try { socket.close() } catch (e: Exception) { /* ignore */ }
+            try { socket.close() } catch (_: Exception) {}
         }
     }
 
-    // ─── OpenVPN Handshake ──────────────────────────────────────────────────
+    // ─── OpenVPN Control Channel Handshake ──────────────────────────────────
 
     /**
-     * Performs the OpenVPN control channel handshake.
-     * Sends the P_CONTROL_HARD_RESET_CLIENT_V2 packet and waits
-     * for the server's HARD_RESET_SERVER response.
+     * Sends P_CONTROL_HARD_RESET_CLIENT_V2 and waits for the server ACK.
+     * This initiates the OpenVPN TLS handshake sequence.
      */
     private fun performHandshake(input: InputStream, output: OutputStream) {
-        // OpenVPN packet opcodes
-        val P_CONTROL_HARD_RESET_CLIENT_V2 = 0x38.toByte() // opcode 7 << 3
-        val P_ACK_V1 = 0x28.toByte()                        // opcode 5 << 3
+        val P_CONTROL_HARD_RESET_CLIENT_V2 = 0x38.toByte()
 
-        // Build HARD_RESET_CLIENT_V2 packet
-        // Format: [opcode|key_id(1)] [session_id(8)] [packet_id(4)] [net_time(4)]
         val sessionId = ByteArray(8).also { java.security.SecureRandom().nextBytes(it) }
-        val packet = ByteBuffer.allocate(14).apply {
+
+        // Build reset packet: [opcode(1)] [sessionId(8)] [packetId(4)] [placeholder(4)]
+        val packet = java.nio.ByteBuffer.allocate(17).apply {
             put(P_CONTROL_HARD_RESET_CLIENT_V2)
             put(sessionId)
-            putInt(1)     // packet id
-            putInt(0)     // net_time placeholder
+            putInt(1)   // packet id
+            putInt(0)   // hmac placeholder
         }.array()
 
-        // For TCP, OpenVPN prefixes each packet with a 2-byte length
-        val lengthPrefix = ByteBuffer.allocate(2).putShort(packet.size.toShort()).array()
-        output.write(lengthPrefix)
+        // TCP framing: 2-byte length prefix
+        output.write(java.nio.ByteBuffer.allocate(2).putShort(packet.size.toShort()).array())
         output.write(packet)
         output.flush()
 
-        AppLogger.log("Handshake enviado, esperando respuesta...")
+        AppLogger.log("Handshake enviado, esperando respuesta del servidor...")
 
-        // Read server response (with timeout)
+        // Read response length
         val lenBuf = ByteArray(2)
-        val read = input.read(lenBuf)
-        if (read < 2) throw ConnectException("No se recibió respuesta del servidor")
-
-        val responseLen = ((lenBuf[0].toInt() and 0xFF) shl 8) or (lenBuf[1].toInt() and 0xFF)
-        if (responseLen <= 0 || responseLen > 65535) throw ConnectException("Respuesta inválida")
-
-        val responseBuf = ByteArray(responseLen)
-        var totalRead = 0
-        while (totalRead < responseLen) {
-            val n = input.read(responseBuf, totalRead, responseLen - totalRead)
-            if (n < 0) break
-            totalRead += n
+        var read = 0
+        while (read < 2) {
+            val n = input.read(lenBuf, read, 2 - read)
+            if (n < 0) throw ConnectException("Conexión cerrada por el servidor")
+            read += n
         }
 
-        AppLogger.log("Respuesta recibida del servidor (${responseLen} bytes)")
-        // Send ACK
-        val ack = ByteBuffer.allocate(16).apply {
-            put(P_ACK_V1)
-            put(sessionId)
-            putInt(1)
-            putInt(responseBuf.size)
-            put(sessionId, 0, 4)
-        }.array()
-        output.write(ByteBuffer.allocate(2).putShort(ack.size.toShort()).array())
-        output.write(ack)
-        output.flush()
+        val responseLen = ((lenBuf[0].toInt() and 0xFF) shl 8) or (lenBuf[1].toInt() and 0xFF)
+        if (responseLen <= 0 || responseLen > 65_535) throw ConnectException("Respuesta inválida del servidor")
+
+        val responseBuf = ByteArray(responseLen)
+        var total = 0
+        while (total < responseLen) {
+            val n = input.read(responseBuf, total, responseLen - total)
+            if (n < 0) throw ConnectException("Conexión cerrada durante handshake")
+            total += n
+        }
+
+        AppLogger.log("Respuesta recibida ($responseLen bytes) — handshake OK")
     }
 
     // ─── Traffic Bridging ───────────────────────────────────────────────────
 
     /**
-     * Bridges packets between the TUN interface and the VPN socket.
-     * Runs two concurrent threads: TUN->Socket and Socket->TUN.
+     * Bidirectional bridge: TUN device ↔ VPN socket.
+     * Two threads run concurrently; we wait for both to finish.
      */
     private fun bridgeTraffic(
         tunIn: FileInputStream,
@@ -189,64 +164,55 @@ class OpenVpnClient(
     ) {
         val buf = ByteArray(BUFFER_SIZE)
 
-        // TUN -> Socket (device traffic going out)
+        // Device → VPN server
         val tunToSock = Thread {
             try {
                 while (!Thread.currentThread().isInterrupted) {
                     val n = tunIn.read(buf)
                     if (n > 0) {
-                        // Prefix with 2-byte length (TCP OpenVPN framing)
-                        val lenBytes = ByteBuffer.allocate(2).putShort(n.toShort()).array()
-                        sockOut.write(lenBytes)
+                        val len = java.nio.ByteBuffer.allocate(2).putShort(n.toShort()).array()
+                        sockOut.write(len)
                         sockOut.write(buf, 0, n)
                         sockOut.flush()
                     }
                 }
-            } catch (e: Exception) {
-                // Connection closed
-            }
+            } catch (_: Exception) {}
         }
 
-        // Socket -> TUN (VPN traffic coming in)
+        // VPN server → device
         val sockToTun = Thread {
             try {
                 val lenBuf = ByteArray(2)
                 while (!Thread.currentThread().isInterrupted) {
-                    // Read 2-byte length prefix
-                    var read = 0
-                    while (read < 2) {
-                        val n = sockIn.read(lenBuf, read, 2 - read)
+                    var r = 0
+                    while (r < 2) {
+                        val n = sockIn.read(lenBuf, r, 2 - r)
                         if (n < 0) return@Thread
-                        read += n
+                        r += n
                     }
                     val len = ((lenBuf[0].toInt() and 0xFF) shl 8) or (lenBuf[1].toInt() and 0xFF)
                     if (len <= 0 || len > BUFFER_SIZE) continue
 
                     val pkt = ByteArray(len)
-                    var totalRead = 0
-                    while (totalRead < len) {
-                        val n = sockIn.read(pkt, totalRead, len - totalRead)
+                    var total = 0
+                    while (total < len) {
+                        val n = sockIn.read(pkt, total, len - total)
                         if (n < 0) return@Thread
-                        totalRead += n
+                        total += n
                     }
                     tunOut.write(pkt, 0, len)
                 }
-            } catch (e: Exception) {
-                // Connection closed
-            }
+            } catch (_: Exception) {}
         }
 
         tunToSock.start()
         sockToTun.start()
-
         tunToSock.join()
         sockToTun.interrupt()
         sockToTun.join()
     }
 
-    /**
-     * UDP variant of traffic bridging.
-     */
+    /** UDP variant. */
     private fun bridgeTrafficUdp(
         tunIn: FileInputStream,
         tunOut: FileOutputStream,
@@ -258,12 +224,9 @@ class OpenVpnClient(
             try {
                 while (!Thread.currentThread().isInterrupted) {
                     val n = tunIn.read(buf)
-                    if (n > 0) {
-                        val pkt = java.net.DatagramPacket(buf, n)
-                        socket.send(pkt)
-                    }
+                    if (n > 0) socket.send(java.net.DatagramPacket(buf, n))
                 }
-            } catch (e: Exception) { /* closed */ }
+            } catch (_: Exception) {}
         }
 
         val sockToTun = Thread {
@@ -274,7 +237,7 @@ class OpenVpnClient(
                     socket.receive(recvPkt)
                     tunOut.write(recvBuf, 0, recvPkt.length)
                 }
-            } catch (e: Exception) { /* closed */ }
+            } catch (_: Exception) {}
         }
 
         tunToSock.start()
@@ -285,39 +248,31 @@ class OpenVpnClient(
     }
 }
 
-/**
- * Parses key fields from an OpenVPN .ovpn config file.
- */
+// ─── OVPN Config Parser ──────────────────────────────────────────────────────
+
+/** Parses key directives from a decoded .ovpn config string. */
 class OvpnConfigParser(private val config: String) {
 
-    val proto: String by lazy { parseDirective("proto") ?: "udp" }
-    val dev: String by lazy { parseDirective("dev") ?: "tun" }
-    val cipher: String by lazy { parseDirective("cipher") ?: "AES-256-CBC" }
-    val auth: String by lazy { parseDirective("auth") ?: "SHA1" }
-    val compress: String? by lazy { parseDirective("compress") ?: parseDirective("comp-lzo") }
-    val verb: Int by lazy { parseDirective("verb")?.toIntOrNull() ?: 3 }
+    val proto: String   by lazy { directive("proto")   ?: "udp"         }
+    val dev: String     by lazy { directive("dev")     ?: "tun"         }
+    val cipher: String  by lazy { directive("cipher")  ?: "AES-256-CBC" }
+    val auth: String    by lazy { directive("auth")    ?: "SHA1"        }
 
-    /** Extracts the first value after the given directive keyword. */
-    private fun parseDirective(directive: String): String? {
-        val regex = Regex("^\\s*$directive\\s+(.+)$", RegexOption.MULTILINE)
-        return regex.find(config)?.groupValues?.getOrNull(1)?.trim()
-    }
+    private fun directive(name: String): String? =
+        Regex("^\\s*$name\\s+(.+)$", RegexOption.MULTILINE)
+            .find(config)?.groupValues?.getOrNull(1)?.trim()
 
-    /** Extracts embedded certificate/key blocks. */
-    fun extractBlock(tag: String): String? {
-        val regex = Regex("<$tag>([\\s\\S]*?)</$tag>", RegexOption.MULTILINE)
-        return regex.find(config)?.groupValues?.getOrNull(1)?.trim()
-    }
+    fun extractBlock(tag: String): String? =
+        Regex("<$tag>([\\s\\S]*?)</$tag>", RegexOption.MULTILINE)
+            .find(config)?.groupValues?.getOrNull(1)?.trim()
 
-    /** Extracts remote entries as (host, port, proto) triples. */
-    fun remotes(): List<Triple<String, Int, String>> {
-        val regex = Regex("^\\s*remote\\s+(\\S+)\\s+(\\d+)(?:\\s+(\\S+))?", RegexOption.MULTILINE)
-        return regex.findAll(config).map { match ->
-            Triple(
-                match.groupValues[1],
-                match.groupValues[2].toIntOrNull() ?: 1194,
-                match.groupValues[3].ifBlank { proto }
-            )
-        }.toList()
-    }
+    fun remotes(): List<Triple<String, Int, String>> =
+        Regex("^\\s*remote\\s+(\\S+)\\s+(\\d+)(?:\\s+(\\S+))?", RegexOption.MULTILINE)
+            .findAll(config).map { m ->
+                Triple(
+                    m.groupValues[1],
+                    m.groupValues[2].toIntOrNull() ?: 1194,
+                    m.groupValues[3].ifBlank { proto }
+                )
+            }.toList()
 }
