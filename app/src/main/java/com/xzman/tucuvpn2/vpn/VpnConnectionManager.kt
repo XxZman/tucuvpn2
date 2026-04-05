@@ -18,7 +18,7 @@ import java.net.Socket
  * 1. Downloads and filters servers
  * 2. Tests each server sequentially
  * 3. Connects via [TucuVpnService] on success
- * 4. Disconnects after 5 seconds (demo) or on user request
+ * 4. Stays connected until user calls stopConnection()
  */
 class VpnConnectionManager(private val context: Context) {
 
@@ -40,8 +40,6 @@ class VpnConnectionManager(private val context: Context) {
 
     /** Connection timeout per server attempt in ms */
     private val connectionTimeoutMs = 10_000L
-    /** How long to stay connected before auto-disconnect (demo mode) */
-    private val connectedDurationMs = 5_000L
 
     /**
      * Checks if the system requires VPN permission and returns the prepare Intent.
@@ -53,7 +51,7 @@ class VpnConnectionManager(private val context: Context) {
 
     /**
      * Starts the full VPN connection flow:
-     * fetch → filter → iterate servers → connect → hold → disconnect
+     * fetch → filter → iterate servers → connect → stay connected
      */
     fun startConnection() {
         connectionJob?.cancel()
@@ -113,14 +111,7 @@ class VpnConnectionManager(private val context: Context) {
                         AppLogger.log("Conectado correctamente a ${server.displayName} (${server.countryLong})")
                         _state.value = State.CONNECTED
                         connected = true
-
-                        // Stay connected for the demo period
-                        delay(connectedDurationMs)
-
-                        AppLogger.log("Desconectando...")
-                        stopVpnService()
-                        _state.value = State.DISCONNECTED
-                        AppLogger.log("Desconectado")
+                        // Connection stays alive until the user calls stopConnection()
                         break
                     } else {
                         AppLogger.log("Error al conectar ${server.displayName}, probando siguiente...")
@@ -192,7 +183,7 @@ class VpnConnectionManager(private val context: Context) {
             putExtra(TucuVpnService.EXTRA_SERVER_IP, serverIp)
             putExtra(TucuVpnService.EXTRA_SERVER_PORT, serverPort)
         }
-        context.startForegroundService(intent)
+        context.startService(intent)
     }
 
     private fun stopVpnService() {
