@@ -106,21 +106,16 @@ class VpnConnectionManager(private val context: Context) {
         connectionJob?.cancel()
         connectionJob = managerScope.launch {
             try {
-                // ── 1. Check OpenVPN for Android is installed ──────────────
-                if (!ovpnCtrl.isOpenVpnInstalled()) {
-                    AppLogger.log(
-                        "ERROR: 'OpenVPN for Android' no está instalado.\n" +
-                        "Instálalo desde Google Play / Amazon App Store\n" +
-                        "(paquete: de.blinkt.openvpn) e intenta de nuevo."
-                    )
-                    _state.value = State.ERROR
-                    return@launch
-                }
-
-                // ── 2. Bind to ics-openvpn service ────────────────────────
+                // ── 1. Bind to ics-openvpn service ───────────────────────
+                // bindService() is the authoritative check — do NOT use
+                // PackageManager.getPackageInfo() which fails on Android 11+
+                // due to package-visibility restrictions even with <queries>.
                 AppLogger.log("Vinculando con servicio OpenVPN...")
                 if (!ovpnCtrl.bind()) {
-                    AppLogger.log("No se pudo conectar al servicio OpenVPN")
+                    AppLogger.log(
+                        "No se pudo conectar al servicio de OpenVPN for Android.\n" +
+                        "Asegúrate de que esté instalado (paquete: de.blinkt.openvpn)."
+                    )
                     _state.value = State.ERROR
                     return@launch
                 }
