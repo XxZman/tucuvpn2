@@ -124,18 +124,18 @@ class VpnConnectionManager(private val context: Context) {
                     _state.value = State.ERROR
                     return@launch
                 }
-                ovpnCtrl.registerStatusCallback(statusCallback)
 
-                // ── 3. Request authorization if needed ────────────────────
+                // ── 3. Authorization FIRST — before any other AIDL call ───
                 //
-                // prepareVPNService() returns a non-null Intent when:
-                //   a) The Android VPN permission hasn't been granted yet, OR
-                //   b) This app hasn't been authorized by the user in
-                //      OpenVPN for Android ("Unauthorized OpenVPN API Caller")
+                // prepareVPNService() is the ONLY ics-openvpn method that does
+                // NOT require prior authorization. Every other method (including
+                // registerStatusCallback, disconnect, startVPN…) throws
+                // SecurityException("Unauthorized OpenVPN API Caller") until the
+                // user has approved this app inside OpenVPN for Android.
                 //
-                // We emit the Intent to authIntentFlow so the Activity can
-                // launch it for result, then suspend here via CompletableDeferred
-                // until the user responds.
+                // So we MUST call prepareVPNService() before anything else.
+                // It returns a non-null Intent when authorization (or Android VPN
+                // permission) is still needed; null means we're already cleared.
                 val prepareIntent = ovpnCtrl.prepareIntent()
                 if (prepareIntent != null) {
                     AppLogger.log("Solicitando autorización a OpenVPN for Android...")
@@ -148,11 +148,14 @@ class VpnConnectionManager(private val context: Context) {
                     if (!authorized) {
                         AppLogger.log("Autorización denegada o cancelada")
                         _state.value = State.ERROR
-                        cleanup()
+                        ovpnCtrl.unbind()   // safe — does not go through AIDL
                         return@launch
                     }
                     AppLogger.log("Autorización concedida, continuando...")
                 }
+
+                // Now authorized — safe to register the status callback
+                ovpnCtrl.registerStatusCallback(statusCallback)
 
                 // ── 4. Fetch and filter servers ───────────────────────────
                 _state.value = State.FETCHING
@@ -254,9 +257,12 @@ class VpnConnectionManager(private val context: Context) {
     // ─── Internal helpers ────────────────────────────────────────────────────
 
     private fun cleanup() {
-        ovpnCtrl.unregisterStatusCallback(statusCallback)
-        ovpnCtrl.disconnect()
-        ovpnCtrl.unbind()
+        // Wrap every AIDL call — if cleanup() is reached via an error path
+        // where the app isn't authorized yet, these calls would throw and
+        // crash the process (that's exactly what caused the FATAL EXCEPTION).
+        try { ovpnCtrl.unregisterStatusCallback(statusCallback) } catch (_: Exception) {}
+        try { ovpnCtrl.disconnect() }                            catch (_: Exception) {}
+        ovpnCtrl.unbind()   // local ServiceConnection — always safe
     }
 
     private suspend fun waitForState(target: State): Boolean {
