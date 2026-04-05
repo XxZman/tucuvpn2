@@ -20,6 +20,14 @@
         android:name="android.software.leanback"
         android:required="false" />
 
+    <!--
+        Android 11+ package visibility: declare that we communicate with
+        OpenVPN for Android so bindService() is allowed to reach it.
+    -->
+    <queries>
+        <package android:name="de.blinkt.openvpn" />
+    </queries>
+
     <application
         android:allowBackup="true"
         android:banner="@drawable/banner"
