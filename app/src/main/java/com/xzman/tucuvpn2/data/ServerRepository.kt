@@ -90,29 +90,35 @@ class ServerRepository {
         val servers = mutableListOf<VpnServer>()
         val lines = raw.lines()
 
-        // Skip comment/header lines (start with '*' or '#')
-        var dataStartIndex = 0
+        // Real VPNGate format:
+        //   *vpn_servers
+        //   #HostName,IP,Score,...,OpenVPN_ConfigData_Base64
+        //   data,data,...
+        //   *
+        //
+        // Bug fix: the header line starts with '#', so we must search for it
+        // and break immediately — otherwise the trailing '*' resets dataStartIndex
+        // past all data rows and the parser sees 0 rows.
+        var dataStartIndex = -1
         for (i in lines.indices) {
-            val line = lines[i]
-            if (line.startsWith("*") || line.startsWith("#") || line.isBlank()) {
-                dataStartIndex = i + 1
-                continue
-            }
-            // First non-comment line is the column header
-            if (line.startsWith("HostName")) {
+            if (lines[i].startsWith("#")) {
                 dataStartIndex = i + 1
                 break
             }
         }
+        if (dataStartIndex < 0) return emptyList()
 
         for (i in dataStartIndex until lines.size) {
             val line = lines[i].trim()
-            if (line.isBlank() || line.startsWith("*")) continue
+            if (line.isBlank() || line.startsWith("*") || line.startsWith("#")) continue
 
             try {
                 val cols = line.split(",")
                 if (cols.size < 15) continue
 
+                // Bug fix: fields 12 (Operator) and 13 (Message) can contain commas,
+                // which shifts all subsequent indices. The base64 is always the LAST
+                // token, so we take cols.last() instead of cols[14].
                 val server = VpnServer(
                     hostName = cols[0],
                     ip = cols[1],
@@ -127,8 +133,8 @@ class ServerRepository {
                     totalTraffic = cols[10].toLongOrNull() ?: 0L,
                     logType = cols[11],
                     operator = cols[12],
-                    message = cols[13],
-                    ovpnConfigDataBase64 = cols[14]
+                    message = cols.subList(13, cols.size - 1).joinToString(","),
+                    ovpnConfigDataBase64 = cols.last()
                 )
                 servers.add(server)
             } catch (e: Exception) {
