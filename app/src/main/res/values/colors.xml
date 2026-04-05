@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Backgrounds -->
+    <color name="bg_dark">#0D1117</color>
+    <color name="bg_console">#161B22</color>
+    <color name="bg_button">#238636</color>
+    <color name="bg_button_pressed">#2EA043</color>
+    <color name="bg_button_focused">#3FB950</color>
+    <color name="bg_button_disabled">#484F58</color>
+
+    <!-- Text -->
+    <color name="white">#FFFFFF</color>
+    <color name="gray_light">#8B949E</color>
+    <color name="green_log">#00FF7F</color>
+    <color name="accent_green">#3FB950</color>
+    <color name="red_error">#F85149</color>
+    <color name="yellow_warning">#E3B341</color>
+
+    <!-- System -->
+    <color name="colorPrimary">#238636</color>
+    <color name="colorPrimaryDark">#1A6B2A</color>
+    <color name="colorAccent">#3FB950</color>
+</resources>

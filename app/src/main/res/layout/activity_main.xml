@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:background="@color/bg_dark"
+    android:padding="32dp"
+    tools:context=".ui.MainActivity">
+
+    <!-- App Title -->
+    <TextView
+        android:id="@+id/tvTitle"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="@string/app_name"
+        android:textColor="@color/white"
+        android:textSize="28sp"
+        android:textStyle="bold"
+        android:gravity="center"
+        android:paddingBottom="24dp"
+        android:fontFamily="sans-serif-medium" />
+
+    <!-- Connect Button -->
+    <Button
+        android:id="@+id/btnConnect"
+        android:layout_width="280dp"
+        android:layout_height="80dp"
+        android:layout_gravity="center_horizontal"
+        android:text="@string/btn_connect"
+        android:textSize="22sp"
+        android:textColor="@color/white"
+        android:textStyle="bold"
+        android:background="@drawable/button_background"
+        android:focusable="true"
+        android:focusableInTouchMode="true"
+        android:nextFocusDown="@id/scrollLog"
+        android:stateListAnimator="@null"
+        android:elevation="6dp" />
+
+    <!-- Progress bar (visible while connecting) -->
+    <ProgressBar
+        android:id="@+id/progressBar"
+        android:layout_width="48dp"
+        android:layout_height="48dp"
+        android:layout_gravity="center_horizontal"
+        android:layout_marginTop="16dp"
+        android:indeterminate="true"
+        android:indeterminateTint="@color/accent_green"
+        android:visibility="gone" />
+
+    <!-- Log console label -->
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="@string/log_title"
+        android:textColor="@color/gray_light"
+        android:textSize="14sp"
+        android:paddingTop="24dp"
+        android:paddingBottom="8dp" />
+
+    <!-- Scrollable log area -->
+    <ScrollView
+        android:id="@+id/scrollLog"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:background="@color/bg_console"
+        android:padding="12dp"
+        android:focusable="true"
+        android:focusableInTouchMode="true"
+        android:nextFocusUp="@id/btnConnect"
+        android:scrollbars="vertical">
+
+        <TextView
+            android:id="@+id/tvLog"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:textColor="@color/green_log"
+            android:textSize="13sp"
+            android:fontFamily="monospace"
+            android:lineSpacingMultiplier="1.4"
+            android:text=""
+            tools:text="[12:00:00] Descargando servidores...\n[12:00:02] Filtrando servidores...\n[12:00:03] Probando servidor JP_1..." />
+
+    </ScrollView>
+
+</LinearLayout>

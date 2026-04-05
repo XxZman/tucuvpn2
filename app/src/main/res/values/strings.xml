@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">TucuVPN2</string>
+    <string name="btn_connect">Conectar</string>
+    <string name="btn_disconnect">Desconectar</string>
+    <string name="btn_cancel">Cancelar</string>
+    <string name="log_title">Consola de Registro</string>
+    <string name="status_idle">Listo para conectar</string>
+    <string name="status_fetching">Descargando servidores...</string>
+    <string name="status_connecting">Conectando...</string>
+    <string name="status_connected">Conectado</string>
+    <string name="status_disconnected">Desconectado</string>
+    <string name="notification_channel_name">TucuVPN Estado</string>
+    <string name="notification_channel_desc">Estado de la conexión VPN</string>
+</resources>

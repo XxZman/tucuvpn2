@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Button background with states for TV remote navigation:
+    - focused: bright green (when D-pad is on the button)
+    - pressed: darker green
+    - normal: standard green
+    - disabled: gray
+-->
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Focused (TV remote hover) -->
+    <item android:state_focused="true">
+        <shape android:shape="rectangle">
+            <solid android:color="@color/bg_button_focused" />
+            <corners android:radius="12dp" />
+            <stroke android:width="3dp" android:color="@color/white" />
+        </shape>
+    </item>
+
+    <!-- Pressed -->
+    <item android:state_pressed="true">
+        <shape android:shape="rectangle">
+            <solid android:color="@color/bg_button_pressed" />
+            <corners android:radius="12dp" />
+        </shape>
+    </item>
+
+    <!-- Disabled -->
+    <item android:state_enabled="false">
+        <shape android:shape="rectangle">
+            <solid android:color="@color/bg_button_disabled" />
+            <corners android:radius="12dp" />
+        </shape>
+    </item>
+
+    <!-- Normal -->
+    <item>
+        <shape android:shape="rectangle">
+            <solid android:color="@color/bg_button" />
+            <corners android:radius="12dp" />
+        </shape>
+    </item>
+
+</selector>
