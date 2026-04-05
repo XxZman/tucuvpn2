@@ -125,36 +125,14 @@ class VpnConnectionManager(private val context: Context) {
                     return@launch
                 }
 
-                // ── 3. Authorization FIRST — before any other AIDL call ───
-                //
-                // prepareVPNService() is the ONLY ics-openvpn method that does
-                // NOT require prior authorization. Every other method (including
-                // registerStatusCallback, disconnect, startVPN…) throws
-                // SecurityException("Unauthorized OpenVPN API Caller") until the
-                // user has approved this app inside OpenVPN for Android.
-                //
-                // So we MUST call prepareVPNService() before anything else.
-                // It returns a non-null Intent when authorization (or Android VPN
-                // permission) is still needed; null means we're already cleared.
-                val prepareIntent = ovpnCtrl.prepareIntent()
-                if (prepareIntent != null) {
-                    AppLogger.log("Solicitando autorización a OpenVPN for Android...")
-                    authDeferred = CompletableDeferred()
-                    _authIntentFlow.emit(prepareIntent)
-
-                    val authorized = authDeferred!!.await()
-                    authDeferred = null
-
-                    if (!authorized) {
-                        AppLogger.log("Autorización denegada o cancelada")
-                        _state.value = State.ERROR
-                        ovpnCtrl.unbind()   // safe — does not go through AIDL
-                        return@launch
-                    }
-                    AppLogger.log("Autorización concedida, continuando...")
+                // ── 3. Authorization ──────────────────────────────────────
+                if (!ensureAuthorized()) {
+                    _state.value = State.ERROR
+                    ovpnCtrl.unbind()
+                    return@launch
                 }
 
-                // Now authorized — safe to register the status callback
+                // Now authorized — safe to use all AIDL methods
                 ovpnCtrl.registerStatusCallback(statusCallback)
 
                 // ── 4. Fetch and filter servers ───────────────────────────
@@ -255,6 +233,72 @@ class VpnConnectionManager(private val context: Context) {
     }
 
     // ─── Internal helpers ────────────────────────────────────────────────────
+
+    /**
+     * Ensures this app is authorized to call ics-openvpn AIDL methods.
+     *
+     * Newer versions of ics-openvpn throw SecurityException("Unauthorized
+     * OpenVPN API Caller") from ALL methods — including prepareVPNService() —
+     * until the user has approved the app inside OpenVPN for Android.
+     *
+     * Strategy:
+     *   1. Try prepareVPNService():
+     *      • Returns null        → already authorized AND VPN permission granted
+     *      • Returns an Intent   → launch it (VPN permission OR auth dialog)
+     *      • Throws SecurityException → not authorized at all; launch ConfirmDialog
+     *                                   directly (bypasses AIDL entirely)
+     *   2. After ConfirmDialog approval, call prepareVPNService() once more to
+     *      handle the Android-level VPN permission if it still needs to be granted.
+     *
+     * Returns true if the app ends up fully authorized, false if the user
+     * denied any dialog.
+     */
+    private suspend fun ensureAuthorized(): Boolean {
+        // First attempt — may throw if not authorized yet
+        val firstIntent: Intent? = try {
+            ovpnCtrl.prepareIntent()
+        } catch (e: SecurityException) {
+            // Not authorized: launch ConfirmDialog directly (no AIDL needed)
+            AppLogger.log("Autorizando TucuVPN2 en OpenVPN for Android...")
+            Intent().apply {
+                component = android.content.ComponentName(
+                    OpenVpnController.OPENVPN_PACKAGE,
+                    "${OpenVpnController.OPENVPN_PACKAGE}.api.ConfirmDialog"
+                )
+            }
+        }
+
+        if (firstIntent != null) {
+            if (!launchAndWait(firstIntent)) {
+                AppLogger.log("Autorización denegada o cancelada")
+                return false
+            }
+            AppLogger.log("Autorización concedida")
+
+            // After ConfirmDialog, still might need Android VPN permission
+            val vpnIntent: Intent? = try {
+                ovpnCtrl.prepareIntent()
+            } catch (_: SecurityException) {
+                AppLogger.log("Error de autorización inesperado")
+                return false
+            }
+            if (vpnIntent != null && !launchAndWait(vpnIntent)) {
+                AppLogger.log("Permiso VPN de Android denegado")
+                return false
+            }
+        }
+
+        return true
+    }
+
+    /** Emits [intent] to the Activity, suspends until the user responds. */
+    private suspend fun launchAndWait(intent: Intent): Boolean {
+        authDeferred = CompletableDeferred()
+        _authIntentFlow.emit(intent)
+        val result = authDeferred!!.await()
+        authDeferred = null
+        return result
+    }
 
     private fun cleanup() {
         // Wrap every AIDL call — if cleanup() is reached via an error path
