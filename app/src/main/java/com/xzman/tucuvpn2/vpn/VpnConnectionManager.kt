@@ -7,8 +7,11 @@ import com.xzman.tucuvpn2.data.ServerRepository
 import com.xzman.tucuvpn2.utils.AppLogger
 import de.blinkt.openvpn.api.IOpenVPNStatusCallback
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.net.InetSocketAddress
 import java.net.Socket
@@ -17,31 +20,34 @@ import java.net.Socket
  * Orchestrates the full VPN connection lifecycle:
  *
  *  1. Verifies OpenVPN for Android is installed
- *  2. Binds to its AIDL service (IOpenVPNAPIService)
- *  3. Downloads and filters VPNGate servers
- *  4. Tests TCP reachability for each server
- *  5. Passes the decoded .ovpn config to ics-openvpn via startVPN()
- *  6. Monitors real-time status via IOpenVPNStatusCallback
- *  7. Stays connected until the user calls stopConnection()
- *
- * All OpenVPN protocol work (TLS, certificates, encryption, key exchange)
- * is handled by the ics-openvpn library — no manual socket/handshake code.
+ *  2. Binds to its AIDL service
+ *  3. Requests user authorization via prepareVPNService() if needed
+ *  4. Downloads and filters VPNGate servers
+ *  5. Tests TCP reachability per server
+ *  6. Calls startVPN() with the decoded .ovpn config
+ *  7. Monitors real-time status via IOpenVPNStatusCallback
+ *  8. Stays connected until the user calls stopConnection()
  */
 class VpnConnectionManager(private val context: Context) {
 
     // ─── State ────────────────────────────────────────────────────────────────
 
-    enum class State {
-        IDLE,
-        FETCHING,
-        CONNECTING,
-        CONNECTED,
-        DISCONNECTED,
-        ERROR
-    }
+    enum class State { IDLE, FETCHING, CONNECTING, CONNECTED, DISCONNECTED, ERROR }
 
     private val _state = MutableStateFlow(State.IDLE)
     val state: StateFlow<State> = _state.asStateFlow()
+
+    /**
+     * Emits an Intent that the Activity must launch for result.
+     * Used for both Android VPN permission and OpenVPN authorization.
+     * replay=1 ensures the Activity catches the event even if it
+     * subscribes slightly after the emit.
+     */
+    private val _authIntentFlow = MutableSharedFlow<Intent>(replay = 1)
+    val authIntentFlow: SharedFlow<Intent> = _authIntentFlow.asSharedFlow()
+
+    /** Suspended until the user grants or denies the authorization dialog. */
+    private var authDeferred: CompletableDeferred<Boolean>? = null
 
     // ─── Internals ────────────────────────────────────────────────────────────
 
@@ -50,18 +56,19 @@ class VpnConnectionManager(private val context: Context) {
     private val managerScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var connectionJob: Job? = null
 
-    /** TCP reachability check timeout per server */
-    private val reachabilityTimeoutMs = 10_000L
+    private val reachabilityTimeoutMs   = 10_000L
+    private val connectConfirmTimeoutMs = 20_000L
 
-    /** How long to wait for ics-openvpn to reach CONNECTED after startVPN() */
-    private val connectConfirmTimeoutMs = 15_000L
+    // ─── Authorization callbacks (called by the Activity) ────────────────────
 
-    // ─── Status callback ──────────────────────────────────────────────────────
+    /** Call this when the user approved the authorization dialog (RESULT_OK). */
+    fun onAuthorizationGranted() { authDeferred?.complete(true) }
 
-    /**
-     * Receives real-time state updates from ics-openvpn.
-     * Maps OpenVPN states to our internal State enum and logs them.
-     */
+    /** Call this when the user dismissed or denied the dialog. */
+    fun onAuthorizationDenied()  { authDeferred?.complete(false) }
+
+    // ─── OpenVPN status callback ──────────────────────────────────────────────
+
     private val statusCallback = object : IOpenVPNStatusCallback.Stub() {
         override fun newStatus(uuid: String?, state: String?, message: String?, level: String?) {
             when (state) {
@@ -69,14 +76,11 @@ class VpnConnectionManager(private val context: Context) {
                     AppLogger.log("Handshake TLS en progreso...")
                     _state.value = State.CONNECTING
                 }
-                OpenVpnController.STATE_AUTH          ->
-                    AppLogger.log("Autenticando con el servidor...")
-                OpenVpnController.STATE_WAIT          ->
-                    AppLogger.log("Esperando respuesta del servidor...")
-                OpenVpnController.STATE_RECONNECTING  ->
-                    AppLogger.log("Reconectando...")
+                OpenVpnController.STATE_AUTH          -> AppLogger.log("Autenticando con el servidor...")
+                OpenVpnController.STATE_WAIT          -> AppLogger.log("Esperando respuesta del servidor...")
+                OpenVpnController.STATE_RECONNECTING  -> AppLogger.log("Reconectando...")
                 OpenVpnController.STATE_CONNECTED     -> {
-                    AppLogger.log("VPN conectada — tráfico redirigido")
+                    AppLogger.log("VPN conectada — tráfico redirigido correctamente")
                     _state.value = State.CONNECTED
                 }
                 OpenVpnController.STATE_EXITING,
@@ -86,58 +90,77 @@ class VpnConnectionManager(private val context: Context) {
                         _state.value = State.DISCONNECTED
                     }
                 }
-                OpenVpnController.STATE_NONETWORK     ->
-                    AppLogger.log("Sin red — esperando conexión...")
-                else -> if (!message.isNullOrBlank())
-                    AppLogger.log("OpenVPN: $message")
+                OpenVpnController.STATE_NONETWORK     -> AppLogger.log("Sin red — esperando conexión...")
+                else -> if (!message.isNullOrBlank()) AppLogger.log("OpenVPN: $message")
             }
         }
     }
 
     // ─── Public API ───────────────────────────────────────────────────────────
 
-    /**
-     * Returns a VPN permission Intent if the user hasn't granted access yet.
-     * Launch this Intent for result before calling startConnection().
-     * Returns null if permission is already granted.
-     */
+    /** Returns Android-level VPN permission intent, or null if already granted. */
     fun prepareVpnIntent(): Intent? = VpnService.prepare(context)
 
-    /**
-     * Starts the full connection flow.
-     * Safe to call multiple times — cancels any running attempt first.
-     */
+    /** Starts the full connection flow. Cancels any previous attempt first. */
     fun startConnection() {
         connectionJob?.cancel()
         connectionJob = managerScope.launch {
             try {
-                // 1 — Check OpenVPN for Android is installed
+                // ── 1. Check OpenVPN for Android is installed ──────────────
                 if (!ovpnCtrl.isOpenVpnInstalled()) {
                     AppLogger.log(
                         "ERROR: 'OpenVPN for Android' no está instalado.\n" +
-                        "Instálalo desde Google Play o Amazon App Store\n" +
-                        "(paquete: de.blinkt.openvpn) y vuelve a intentarlo."
+                        "Instálalo desde Google Play / Amazon App Store\n" +
+                        "(paquete: de.blinkt.openvpn) e intenta de nuevo."
                     )
                     _state.value = State.ERROR
                     return@launch
                 }
 
-                // 2 — Bind to ics-openvpn service
+                // ── 2. Bind to ics-openvpn service ────────────────────────
                 AppLogger.log("Vinculando con servicio OpenVPN...")
-                val bound = ovpnCtrl.bind()
-                if (!bound) {
+                if (!ovpnCtrl.bind()) {
                     AppLogger.log("No se pudo conectar al servicio OpenVPN")
                     _state.value = State.ERROR
                     return@launch
                 }
                 ovpnCtrl.registerStatusCallback(statusCallback)
 
-                // 3 — Fetch and filter servers
+                // ── 3. Request authorization if needed ────────────────────
+                //
+                // prepareVPNService() returns a non-null Intent when:
+                //   a) The Android VPN permission hasn't been granted yet, OR
+                //   b) This app hasn't been authorized by the user in
+                //      OpenVPN for Android ("Unauthorized OpenVPN API Caller")
+                //
+                // We emit the Intent to authIntentFlow so the Activity can
+                // launch it for result, then suspend here via CompletableDeferred
+                // until the user responds.
+                val prepareIntent = ovpnCtrl.prepareIntent()
+                if (prepareIntent != null) {
+                    AppLogger.log("Solicitando autorización a OpenVPN for Android...")
+                    authDeferred = CompletableDeferred()
+                    _authIntentFlow.emit(prepareIntent)
+
+                    val authorized = authDeferred!!.await()
+                    authDeferred = null
+
+                    if (!authorized) {
+                        AppLogger.log("Autorización denegada o cancelada")
+                        _state.value = State.ERROR
+                        cleanup()
+                        return@launch
+                    }
+                    AppLogger.log("Autorización concedida, continuando...")
+                }
+
+                // ── 4. Fetch and filter servers ───────────────────────────
                 _state.value = State.FETCHING
                 val result = repository.fetchServers()
                 if (result.isFailure) {
                     AppLogger.log("No se pudo obtener la lista de servidores")
                     _state.value = State.ERROR
+                    cleanup()
                     return@launch
                 }
 
@@ -145,13 +168,14 @@ class VpnConnectionManager(private val context: Context) {
                 if (servers.isEmpty()) {
                     AppLogger.log("No se encontraron servidores disponibles")
                     _state.value = State.ERROR
+                    cleanup()
                     return@launch
                 }
 
                 AppLogger.log("Probando ${servers.size} servidores...")
                 _state.value = State.CONNECTING
 
-                // 4 — Try each server in order
+                // ── 5. Try each server ────────────────────────────────────
                 var connected = false
                 for ((index, server) in servers.withIndex()) {
                     if (!isActive) break
@@ -169,7 +193,6 @@ class VpnConnectionManager(private val context: Context) {
 
                     val (serverIp, serverPort) = extractRemote(ovpnConfig, server.ip)
 
-                    // Quick TCP reachability check before handing off to OpenVPN
                     val reachable = withTimeoutOrNull(reachabilityTimeoutMs) {
                         testTcpReachability(serverIp, serverPort)
                     } ?: false
@@ -179,11 +202,11 @@ class VpnConnectionManager(private val context: Context) {
                         continue
                     }
 
-                    // 5 — Pass config to ics-openvpn (handles TLS/certs/encryption)
+                    // ── 6. Start real OpenVPN (TLS/certs handled by ics-openvpn)
                     AppLogger.log("Iniciando OpenVPN para ${server.displayName}...")
                     ovpnCtrl.startVpn(ovpnConfig)
 
-                    // 6 — Wait for CONNECTED state via status callback
+                    // ── 7. Wait for CONNECTED confirmation via status callback
                     val confirmed = withTimeoutOrNull(connectConfirmTimeoutMs) {
                         waitForState(State.CONNECTED)
                     } ?: false
@@ -193,91 +216,75 @@ class VpnConnectionManager(private val context: Context) {
                             "Conectado correctamente a ${server.displayName} (${server.countryLong})"
                         )
                         connected = true
-                        // Connection stays alive — exit loop, keep scope alive
-                        break
+                        break   // stay connected — coroutine exits, VPN keeps running
                     } else {
                         AppLogger.log(
                             "Error al conectar ${server.displayName}, probando siguiente..."
                         )
                         ovpnCtrl.disconnect()
-                        delay(500) // brief pause before trying the next server
+                        delay(800)
                     }
                 }
 
                 if (!connected) {
                     AppLogger.log("No se pudo conectar a ningún servidor disponible")
                     _state.value = State.ERROR
-                    ovpnCtrl.unregisterStatusCallback(statusCallback)
-                    ovpnCtrl.unbind()
+                    cleanup()
                 }
 
-                // If connected: coroutine ends here but the VPN keeps running inside
-                // ics-openvpn. stopConnection() handles teardown.
-
             } catch (e: CancellationException) {
-                // Normal cancellation — stopConnection() handles cleanup
+                // Normal cancellation via stopConnection()
             } catch (e: Exception) {
                 AppLogger.log("Error inesperado: ${e.message}")
                 _state.value = State.ERROR
-                ovpnCtrl.unregisterStatusCallback(statusCallback)
-                ovpnCtrl.unbind()
+                cleanup()
             }
         }
     }
 
-    /**
-     * Disconnects the active VPN and resets state.
-     * Called when the user presses "Desconectar".
-     */
+    /** Disconnects and resets. Called when user presses "Desconectar". */
     fun stopConnection() {
         connectionJob?.cancel()
-        ovpnCtrl.unregisterStatusCallback(statusCallback)
-        ovpnCtrl.disconnect()
-        ovpnCtrl.unbind()
+        authDeferred?.complete(false)  // unblock any pending auth wait
+        cleanup()
         _state.value = State.IDLE
         AppLogger.log("Desconectado")
     }
 
-    // ─── Helpers ─────────────────────────────────────────────────────────────
+    // ─── Internal helpers ────────────────────────────────────────────────────
 
-    /**
-     * Polls the state flow until it reaches [target] or the caller's
-     * timeout (via withTimeoutOrNull) expires.
-     */
+    private fun cleanup() {
+        ovpnCtrl.unregisterStatusCallback(statusCallback)
+        ovpnCtrl.disconnect()
+        ovpnCtrl.unbind()
+    }
+
     private suspend fun waitForState(target: State): Boolean {
         while (true) {
-            if (_state.value == target) return true
-            if (_state.value == State.ERROR || _state.value == State.DISCONNECTED) return false
-            delay(200)
+            when (_state.value) {
+                target               -> return true
+                State.ERROR,
+                State.DISCONNECTED   -> return false
+                else                 -> delay(200)
+            }
         }
     }
 
-    /**
-     * Opens a TCP socket to [ip]:[port] to verify the server is reachable
-     * before spending the full OpenVPN handshake budget on it.
-     */
     private suspend fun testTcpReachability(ip: String, port: Int): Boolean =
         withContext(Dispatchers.IO) {
             try {
                 Socket().use { it.connect(InetSocketAddress(ip, port), 5_000) }
                 true
-            } catch (_: Exception) {
-                false
-            }
+            } catch (_: Exception) { false }
         }
 
-    /**
-     * Extracts the (host, port) from the `remote` directive in the .ovpn
-     * config, falling back to the server's known IP on port 1194.
-     */
     private fun extractRemote(ovpnConfig: String, fallbackIp: String): Pair<String, Int> {
         val match = Regex(
             "^\\s*remote\\s+(\\S+)\\s+(\\d+)", RegexOption.MULTILINE
         ).find(ovpnConfig)
-        return if (match != null) {
+        return if (match != null)
             Pair(match.groupValues[1], match.groupValues[2].toIntOrNull() ?: 1194)
-        } else {
+        else
             Pair(fallbackIp, 1194)
-        }
     }
 }

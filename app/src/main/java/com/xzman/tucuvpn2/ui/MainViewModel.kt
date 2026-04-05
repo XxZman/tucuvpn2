@@ -3,39 +3,39 @@ package com.xzman.tucuvpn2.ui
 import android.app.Application
 import android.content.Intent
 import androidx.lifecycle.AndroidViewModel
-import androidx.lifecycle.viewModelScope
 import com.xzman.tucuvpn2.utils.AppLogger
 import com.xzman.tucuvpn2.vpn.VpnConnectionManager
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 
-/**
- * ViewModel for [MainActivity].
- * Holds the [VpnConnectionManager] across configuration changes and
- * exposes the connection state and log output as StateFlows.
- */
 class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val vpnManager = VpnConnectionManager(application)
 
-    /** Current VPN state */
     val vpnState: StateFlow<VpnConnectionManager.State> = vpnManager.state
+    val logText:  StateFlow<String>  = AppLogger.logFlow
 
-    /** Formatted log text */
-    val logText: StateFlow<String> = AppLogger.logFlow
+    /**
+     * Emits an Intent that must be launched for result by the Activity.
+     * Can be an Android VPN permission dialog OR an OpenVPN for Android
+     * authorization dialog — both are handled the same way.
+     */
+    val authIntentFlow: SharedFlow<Intent> = vpnManager.authIntentFlow
 
-    /** Returns a VPN permission intent if needed, null if already granted */
     fun prepareVpnIntent(): Intent? = vpnManager.prepareVpnIntent()
 
-    /** Starts the VPN connection flow */
     fun connect() {
         AppLogger.clear()
         vpnManager.startConnection()
     }
 
-    /** Stops the VPN and resets state */
-    fun disconnect() {
-        vpnManager.stopConnection()
-    }
+    fun disconnect() = vpnManager.stopConnection()
+
+    /** Called by the Activity when the authorization dialog returns RESULT_OK. */
+    fun onAuthorizationGranted() = vpnManager.onAuthorizationGranted()
+
+    /** Called by the Activity when the dialog is cancelled or denied. */
+    fun onAuthorizationDenied()  = vpnManager.onAuthorizationDenied()
 
     override fun onCleared() {
         vpnManager.stopConnection()
