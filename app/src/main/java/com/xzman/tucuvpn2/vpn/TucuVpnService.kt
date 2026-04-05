@@ -1,19 +1,10 @@
 package com.xzman.tucuvpn2.vpn
 
-import android.app.Notification
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import android.app.PendingIntent
-import android.content.Context
 import android.content.Intent
 import android.net.VpnService
 import android.os.Binder
-import android.os.Build
 import android.os.IBinder
 import android.os.ParcelFileDescriptor
-import androidx.core.app.NotificationCompat
-import com.xzman.tucuvpn2.R
-import com.xzman.tucuvpn2.ui.MainActivity
 import com.xzman.tucuvpn2.utils.AppLogger
 import kotlinx.coroutines.*
 
@@ -21,21 +12,18 @@ import kotlinx.coroutines.*
  * VPN Service that establishes the TUN interface and forwards traffic
  * through an OpenVPN connection.
  *
- * This service:
- * 1. Builds the VPN TUN interface via VpnService.Builder
- * 2. Manages the VPN tunnel lifecycle
- * 3. Runs as a foreground service with a persistent notification
+ * NOTE: On Android 14+ (targetSdk 34) VpnService must NOT call
+ * startForeground(). The system manages the VPN notification itself
+ * via the BIND_VPN_SERVICE permission. Calling startForeground() here
+ * causes MissingForegroundServiceTypeException.
  */
 class TucuVpnService : VpnService() {
 
     companion object {
-        const val NOTIFICATION_CHANNEL_ID = "tucu_vpn_channel"
-        const val NOTIFICATION_ID = 1001
-
         const val ACTION_START = "com.xzman.tucuvpn2.START_VPN"
-        const val ACTION_STOP = "com.xzman.tucuvpn2.STOP_VPN"
+        const val ACTION_STOP  = "com.xzman.tucuvpn2.STOP_VPN"
         const val EXTRA_OVPN_CONFIG = "ovpn_config"
-        const val EXTRA_SERVER_IP = "server_ip"
+        const val EXTRA_SERVER_IP   = "server_ip"
         const val EXTRA_SERVER_PORT = "server_port"
 
         @Volatile
@@ -55,14 +43,7 @@ class TucuVpnService : VpnService() {
         fun getService(): TucuVpnService = this@TucuVpnService
     }
 
-    override fun onBind(intent: Intent): IBinder {
-        return binder
-    }
-
-    override fun onCreate() {
-        super.onCreate()
-        createNotificationChannel()
-    }
+    override fun onBind(intent: Intent): IBinder = binder
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -71,10 +52,9 @@ class TucuVpnService : VpnService() {
                 return START_NOT_STICKY
             }
             ACTION_START -> {
-                val config = intent.getStringExtra(EXTRA_OVPN_CONFIG) ?: return START_NOT_STICKY
-                val serverIp = intent.getStringExtra(EXTRA_SERVER_IP) ?: return START_NOT_STICKY
+                val config    = intent.getStringExtra(EXTRA_OVPN_CONFIG) ?: return START_NOT_STICKY
+                val serverIp  = intent.getStringExtra(EXTRA_SERVER_IP)   ?: return START_NOT_STICKY
                 val serverPort = intent.getIntExtra(EXTRA_SERVER_PORT, 1194)
-                startForeground(NOTIFICATION_ID, buildNotification("Conectando..."))
                 startVpn(config, serverIp, serverPort)
             }
         }
@@ -92,7 +72,6 @@ class TucuVpnService : VpnService() {
                 AppLogger.log("Iniciando servicio VPN...")
                 currentServerIp = serverIp
 
-                // Build the TUN interface
                 val builder = Builder().apply {
                     addAddress("10.8.0.2", 24)
                     addRoute("0.0.0.0", 0)
@@ -109,24 +88,22 @@ class TucuVpnService : VpnService() {
                 vpnInterface = pfd
 
                 isConnected = true
-                updateNotification("Conectado a $serverIp")
                 AppLogger.log("Interfaz TUN establecida")
 
-                // Start the OpenVPN client tunnel.
                 // Pass the ParcelFileDescriptor directly — never use /proc/self/fd/$fd
                 // because SELinux blocks that path on Android.
                 val client = OpenVpnClient(
-                    context = this@TucuVpnService,
+                    context    = this@TucuVpnService,
                     vpnService = this@TucuVpnService,
-                    tunPfd = pfd,
+                    tunPfd     = pfd,
                     ovpnConfig = ovpnConfig,
-                    serverIp = serverIp,
+                    serverIp   = serverIp,
                     serverPort = serverPort
                 )
                 client.run()
 
             } catch (e: CancellationException) {
-                // Job was cancelled, normal flow
+                // Job cancelled — normal shutdown flow
             } catch (e: Exception) {
                 AppLogger.log("Error en servicio VPN: ${e.message}")
                 isConnected = false
@@ -142,15 +119,13 @@ class TucuVpnService : VpnService() {
         isConnected = false
         currentServerIp = ""
         closeVpnInterface()
-        stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
 
     private fun closeVpnInterface() {
         try {
             vpnInterface?.close()
-        } catch (e: Exception) {
-            // Ignore close errors
+        } catch (_: Exception) {
         } finally {
             vpnInterface = null
         }
@@ -160,51 +135,5 @@ class TucuVpnService : VpnService() {
         stopVpn()
         serviceScope.cancel()
         super.onDestroy()
-    }
-
-    // ─── Notifications ──────────────────────────────────────────────────────
-
-    private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                NOTIFICATION_CHANNEL_ID,
-                "TucuVPN Estado",
-                NotificationManager.IMPORTANCE_LOW
-            ).apply {
-                description = "Estado de la conexión VPN"
-            }
-            val manager = getSystemService(NotificationManager::class.java)
-            manager.createNotificationChannel(channel)
-        }
-    }
-
-    private fun buildNotification(status: String): Notification {
-        val intent = Intent(this, MainActivity::class.java)
-        val pendingIntent = PendingIntent.getActivity(
-            this, 0, intent,
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
-
-        val stopIntent = Intent(this, TucuVpnService::class.java).apply {
-            action = ACTION_STOP
-        }
-        val stopPendingIntent = PendingIntent.getService(
-            this, 1, stopIntent,
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
-
-        return NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
-            .setContentTitle("TucuVPN2")
-            .setContentText(status)
-            .setSmallIcon(android.R.drawable.ic_lock_lock)
-            .setContentIntent(pendingIntent)
-            .addAction(android.R.drawable.ic_delete, "Desconectar", stopPendingIntent)
-            .setOngoing(true)
-            .build()
-    }
-
-    private fun updateNotification(status: String) {
-        val manager = getSystemService(NotificationManager::class.java)
-        manager.notify(NOTIFICATION_ID, buildNotification(status))
     }
 }
